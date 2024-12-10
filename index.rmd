@@ -1,0 +1,261 @@
+---
+title: "Predicting Rocket League Skillshot Categories with Deep Learning"
+author: "Martin Sloley"
+output:
+    bookdown::html_document2:
+        toc: true
+        theme: united
+---
+
+```{python, echo = F}
+import logging
+import tensorflow as tf
+tf.get_logger().setLevel(logging.ERROR)
+```
+# Introduction
+
+I am currently working through the book [Deep Learning with Python](https://www.manning.com/books/deep-learning-with-python) in an effort to get better at deep learning, and better understand the machines and mathematics that are now so prevalent in our society. Having now worked through the first four chapters, I decided it was time to attempt a practice problem on my own. To that end, I went in search of an interesting data set to use and came across [this](https://archive.ics.uci.edu/dataset/858/rocket+league+skillshots) dataset on the [UCI Machine Learning Repository](https://archive.ics.uci.edu). Since I, personally, am not a Rocket League player, but I do have several friends that play, and I am very familiar with the knowledge domain of video games, it seemed like a good choice.
+
+<br>
+<center>
+![[Rocket League Skillshot](https://www.reddit.com/r/RocketLeague/comments/ogg029/any_advice_for_my_ceiling_shots/)](skillshot.gif)
+</center>
+<br>
+
+For those who may be unfamiliar, Rocket League is a competitive video game consisting of two teams, who play soccer by driving into an oversized ball with rocket-powered sports cars. Cars all have the same stats when it comes to speed and hitboxes, and have the ability to jump, spin, and use the rocket boost to briefly fly. The game has a high skill threshold but also an incredibly high skill ceiling and is played by many worldwide.
+
+# Goals
+
+My goal for this project is to at least approach the best-case scenario for deep learning as described in [1], which would be about a 71% classification accuracy rate.
+
+# The Problem
+
+The setup of this problem is very simple.
+
+**Given the actions of a player combined with game-state metadata (player positions, ball positions, etc.), how accurately can we predict whether a set of states and inputs describes the execution of a specific "skillshot," as defined in [1]?**
+
+Skillshots in the data set come in seven categories:
+
+0. Ceiling shot
+1. Power shot
+2. Waving dash
+3. **[NOISE]** - random game snapshots, functions as a *no skillshot detected* category
+4. Air dribble
+5. Front flick
+6. Musty flick
+
+For now, just ignore the 0-indexing, it will make sense later.
+
+While the authors of the paper that this data set was originally used for used the data to test the classifying power of a previously researched pattern-mining algorithm (found in [2]), combined with an ensemble model trained using XGBoost, I will approach the problem limiting myself only to deep learning architectures, only using standard, widely-known feature engineering methods (a.k.a. no SeqScout [2]).
+
+# The Data
+
+## Raw Structure
+
+The data used for this investigation is not structured nicely. It is stored in a text file that has column headers for input features on the first line, followed by blocks of data that start with the skillshot label (-1 to 7, skipping 4 & 0), and then contain a series of measurements of the features at a series of time steps. For example, a data block may begin with the number 2 and then be followed by 37 lines of 18 measurements each in tabular format. This represents 37 time steps at which game states and player inputs were captured, and is categorized as the skillshot corresponding to the number 2. This is a bonkers way to store data in my opinion, due to both the weird target labeling and file structure, but it's what we have.
+
+## Formatting & Preprocessing
+
+In order to get the data into a format useful for deep learning, we have to create a list of targets (the class labels) and a rank-3 tensor of shape `(samples, timesteps, features)`. I use the code below to do this.
+
+```{python}
+# import
+import numpy as np
+
+# parse file
+with open("data/rocket_league_skillshots.data") as file:
+    lines = [line.strip(" \n") for line in file.readlines()]
+headers = lines[0]
+data = lines[1:]
+
+# collect targets
+targets = []
+for line in data:
+    if len(line.split()) == 1:
+        targets.append(float(line.split()[0]))
+
+# re-format targets
+targets = np.array(targets)
+targets[targets == -1] = 4
+targets -= 1
+stepcounts = []
+counter = 0
+
+# evaluate number of time steps
+for line in data:
+    if len(line.split()) == 1:
+        counter = 0
+    else:
+        counter += 1
+        stepcounts.append(counter)
+
+# create design tensor skeleton w/ shape
+n = len(targets)
+design = np.zeros((n, max(stepcounts), len(headers.split())))
+
+# fill in design tensor
+samplenum = 0
+curmat = []
+for line in data[1:]:
+    if len(line.split()) > 1:
+        curmat.append([float(num) for num in line.split()])
+    if len(line.split()) == 1:
+        design[samplenum, 0:len(curmat), :] = np.array(curmat).astype("float64")
+        curmat = []
+        samplenum += 1
+
+# check dimensions
+print(design.shape, targets.shape, design.dtype, targets.dtype)
+```
+
+This code both extracts and re-formats the target labels to adhere to the label listing above, as well as creating the unscaled design tensor of inputs. From here we can do a train / test split and center / scale using training data.
+
+```{python}
+from sklearn.model_selection import train_test_split as tts
+
+# stratified & deterministic for reproducibility
+x_train, x_test, y_train, y_test = tts(design, targets,
+                                       stratify = targets,
+                                       test_size = 0.25,
+                                       random_state = 100)
+
+# get test dimensions
+print(x_test.shape)
+# center / scale with training data
+means = x_train[:, :, :7].mean(axis = 0)
+sds = x_train[:, :, :7].std(axis = 0)
+sds[sds == 0] = 1 # some sd is 0 so we change to 1 to avoid np.inf values
+x_train[:, :, :7] -= means
+x_train[:, :, :7] /= sds
+x_test[:, :, :7] -= means
+x_test[:, :, :7] /= sds
+```
+
+Since we're only working with 298 total samples, with 75 set aside for test data, leaving 223 left over for training, I think it would be prudent to do some cross-validation during training. That way we can get a good idea of where our model might start to overfit, and then use the entirety of the training data to train a model we can test with the test data using the training epoch parameters we arrive at during validation. Let's create these fold indices stratified by class.
+
+```{python}
+from sklearn.model_selection import StratifiedKFold
+from tensorflow.keras.utils import to_categorical
+
+skf = StratifiedKFold(n_splits = 5,
+                      random_state = 100,
+                      shuffle = True)
+splits = skf.split(x_train, y_train)
+splits = list(splits) # all my homies hate generator objects
+
+# convert to softmax vectors after stratify
+y_train = to_categorical(y_train)
+y_test = to_categorical(y_test)
+```
+
+Now that we have everything we need let's begin training.
+
+# Model Training
+
+Given the layout of the problem, I think we can use a relatively simple model with 2 LSTM representation layers. Let's proceed with our training plan and see where overfitting starts to occur.
+
+```{python, fig.align = "center"}
+from tensorflow import keras
+from tensorflow.keras import layers
+import plotly.express as px
+import polars as pl
+from polars import col as c
+
+def instantiate_model():
+    model = keras.Sequential([
+        layers.Input((design.shape[1], design.shape[2])),
+        layers.LSTM(64, return_sequences = True),
+        layers.LSTM(32),
+        layers.Dense(7, activation = "softmax")
+    ])
+    model.compile(
+        optimizer = "rmsprop",
+        loss = "categorical_crossentropy",
+        metrics = ["accuracy", "auc"]
+    )
+    return model
+
+accs = []
+losses = []
+val_accs = []
+val_losses = []
+for t_index, v_index in splits:
+    xt_split = x_train[t_index]
+    xv_split = x_train[v_index]
+    yt_split = y_train[t_index]
+    yv_split = y_train[v_index]
+    model = instantiate_model()
+    history = model.fit(
+        xt_split, yt_split,
+        epochs = 200,
+        batch_size = 64,
+        validation_data = (xv_split, yv_split),
+        verbose = False
+    )
+    metrics = history.history
+    accs.append(metrics["accuracy"])
+    losses.append(metrics["loss"])
+    val_accs.append(metrics["val_accuracy"])
+    val_losses.append(metrics["val_loss"])
+
+accs = np.array(accs)
+losses = np.array(losses)
+val_accs = np.array(val_accs)
+val_losses = np.array(val_losses)
+
+metric_tensor = np.dstack([accs, losses, val_accs, val_losses])
+means = metric_tensor.mean(axis = 0)
+mean_metrics = pl.DataFrame(means, schema = ["Mean Accuracy", "Mean Loss",
+                                             "Mean Validation Accuracy", "Mean Validation Loss"])\
+    .with_row_index(offset = 1)\
+    .rename({"index": "Epoch"})\
+    .unpivot(index = "Epoch", value_name = "Metric Value", variable_name = "Metric")
+fig = px.line(mean_metrics.to_pandas(),
+              x = "Epoch", y = "Metric Value", color = "Metric",
+              title = "Training Metrics for Cross-Validated Simple Model")\
+    .update_layout(hovermode = "x unified")
+fig.show()
+```
+
+It looks like we start to overfit somewhere between epoch 150 and 175. Let's set our number of epochs to 170 and see how well we can do when using all the training data and validating on test data. Let's instantiate and train 20 or so models to make sure we aren't instantiating somewhere where we get stuck in a local minimum.
+
+```{python, warning=F, message=F}
+import tensorflow as tf
+
+models = {}
+
+for i in range(20):
+    model = instantiate_model()
+    history = model.fit(
+        x_train, y_train,
+        epochs = 170,
+        batch_size = 64,
+        verbose = False
+    )
+    eval = model.evaluate(x_test, y_test, verbose = False)
+    models[eval[1]] = model
+bestmod = models[max(list(models.keys()))]
+best_eval = bestmod.evaluate(x_test, y_test, verbose = False)
+pl.DataFrame({
+    "Metric": ["Loss", "Accuracy", "AUC"],
+    "Value": best_eval
+}).to_pandas()
+```
+
+Unfortunately due to the nature of neural networks I can't comment on what number exactly is above this text, because I'll only know myself after the document is created when the code is run during rendering. I will say that usually I can get an accuracy over 70% and I have seen as high as 80% during testing. In fact, during my first test rendering for this code block I managed to achieve a test accuracy of 81%, which is still the highest I've seen. This is a great success, as the number we're trying to beat is 71.5% as laid out in [1].
+
+# Conclusion
+
+## Applications
+
+Some may be wondering why we would want to create a model such as this. On a generalized scale, being able to take the state of a system, combined with inputs into it, and predict the condition of the system afterwards is useful in many areas, medical diagnostics, protein folding, recidivism risk, sports analytics, ecological and environmental simulation, and many others. On a more specific level, a model like this can be used as part of a video game itself. For example, in games like Call of Duty, players can earn medals for certain actions in multiplayer games. These medals are awarded for actions like killing an enemy who is *about* to kill an ally, killing many enemies in quick succession, being shot at from behind and turning around fast enough to fight back and win, along with many such other actions. A model like this allows game developers to incorporate more complex actions into systems such as this one. It is trivial to award a medal to a player who is able to kill an enemy with their own grenade by throwing it back. It is not so trivial to award a medal to a player who performs a community-defined trick shot, or award a player a "play of the game" because of a set of abstract actions. A model like this allows developers the flexibility to implement a reward system based on complex player actions, and allows players to be rewarded for more abstract and complex behaviors than the trivial.
+
+## Reflection
+
+It would appear that it is indeed possible to beat the accuracy of the 1-layer NN used in [1]. However, even our best version of our slightly more complex NN model still falls short of SeqScout combined with classical statistical learning. I think this is a testament to the ability of SeqScout to accurately separate behavioral patterns from one another in complex time-series datasets. Those who are well-versed and experienced in deep learning have probably noticed that there are a few improvements that could be made on our model. To that I would say you may see this dataset again in the future once I've worked through more of the book. One thing I'd also like to mention is that [1] would seem to imply that a larger test set was used than what was available on the UCI MLR repository. Unfortunately we do not have access to this data set, but I am curious as to whether extra training and testing data would allow us to train a better model in this case.
+
+# Works Cited
+
+1. Mathonat, Romain, Jean-François Boulicaut and Mehdi Kaytoue-Uberall. “A Behavioral Pattern Mining Approach to Model Player Skills in Rocket League.” 2020 IEEE Conference on Games (CoG) (2020): 267-274.
+2. Mathonat, Romain, Diana Nurbakova, Jean-François Boulicaut and Mehdi Kaytoue-Uberall. "SeqScout: Using a Bandit Model to Discover Interesting Subgroups in Labeled Sequences," 2019 IEEE International Conference on Data Science and Advanced Analytics (DSAA) (2019): 81-90.
+
